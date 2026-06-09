@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# CodeBuddy 本地配置（保留 automations 目录）
+.codebuddy/settings.local.json
+
+# 系统文件
+.DS_Store
+Thumbs.db

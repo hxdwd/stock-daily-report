@@ -32,6 +32,17 @@ jobs:
           AI_MODEL: ${{ secrets.AI_MODEL }}
         run: python main.py
 
+      - name: 发送邮件报告
+        # 只有配置了邮件 Secrets 才执行，未配置则跳过
+        if: ${{ secrets.SMTP_USER != '' }}
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python main.py --send-email
+
       - name: 提交报告到仓库
         run: |
           git config user.name "github-actions[bot]"

@@ -39,8 +39,7 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        # 始终执行，Python 脚本内部判断是否配置了邮件
-        run: python main.py --send-email
+        run: python send_email.py
 
       - name: 提交报告到仓库
         run: |

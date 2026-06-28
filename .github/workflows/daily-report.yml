@@ -42,6 +42,27 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python send_email.py
 
+      - name: 清除旧报告（仅保留最近3天）
+        run: |
+          python -c "
+          import os, glob, re
+          from datetime import datetime, timedelta, timezone
+          TZ = timezone(timedelta(hours=8))
+          now = datetime.now(TZ)
+          cutoff = now - timedelta(days=3)
+          pattern = '每日股市新闻分析报告_*.md'
+          deleted = 0
+          for f in sorted(glob.glob(pattern)):
+              match = re.search(r'(\d{8})', f)
+              if match:
+                  d = datetime.strptime(match.group(1), '%Y%m%d').replace(tzinfo=TZ)
+                  if d < cutoff:
+                      os.remove(f)
+                      deleted += 1
+                      print(f'  🗑 已删除: {f}')
+          print(f'✅ 清理完成，删除了 {deleted} 个旧报告')
+          "
+
       - name: 提交报告到仓库
         run: |
           git config user.name "github-actions[bot]"

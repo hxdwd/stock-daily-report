@@ -3,8 +3,12 @@
 ==============================================
 每天自动搜索最新国内外财经新闻，调用 AI API 生成结构化分析报告。
 运行方式：python main.py [--send-email]
-依赖环境变量：AI_API_KEY, AI_API_BASE (可选), AI_MODEL (可选), FINNHUB_API_KEY
+依赖环境变量：AI_API_KEY, AI_API_BASE (可选), AI_MODEL (可选)
 邮件发送需要：SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_TO
+
+行情数据源（免费公开接口，无需 API Key）：
+- 东方财富 push2 API：A股指数、港股指数、黄金、外汇
+- 新浪财经 hq.sinajs.cn：商品期货、外汇、美股指数
 """
 
 import os
@@ -38,10 +42,6 @@ API_KEY = os.environ.get("AI_API_KEY", "")
 API_BASE = os.environ.get("AI_API_BASE", "https://api.openai.com/v1")
 API_MODEL = os.environ.get("AI_MODEL", "gpt-4o")
 
-# Finnhub 实时行情配置
-FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
-FINNHUB_BASE = "https://finnhub.io/api/v1"
-
 # 邮件配置
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -56,121 +56,221 @@ MEMORY_FILE = os.path.join(OUTPUT_DIR, ".codebuddy", "automations", "automation"
 
 
 # ============================================================
-# Finnhub 实时行情数据抓取
+# 免费行情数据抓取（东方财富 + 新浪财经）
 # ============================================================
 
-def _finnhub(endpoint: str, params: dict = None) -> dict:
-    """调用 Finnhub API"""
-    if not FINNHUB_KEY:
-        return None
-    url = f"{FINNHUB_BASE}{endpoint}?token={FINNHUB_KEY}"
-    if params:
-        for k, v in params.items():
-            url += f"&{k}={v}"
+def _http_get(url: str, referer: str = None, timeout: int = 15) -> str:
+    """通用 HTTP GET 请求，返回文本"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if referer:
+        headers["Referer"] = referer
+    req = Request(url, headers=headers)
+    with urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        # 尝试常见编码
+        for enc in ["utf-8", "gb2312", "gbk", "gb18030"]:
+            try:
+                return raw.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+
+def _em_indices(secids: str) -> dict:
+    """
+    东方财富 push2 批量行情接口
+    返回 {code: {"name": str, "price": float, "change_pct": float, "change": float}}
+    """
+    url = (
+        "https://push2.eastmoney.com/api/qt/ulist.np/get"
+        f"?fltt=2&secids={secids}&fields=f2,f3,f4,f12,f14"
+    )
     try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        data = json.loads(_http_get(url))
+        result = {}
+        for item in data.get("data", {}).get("diff", []):
+            code = item.get("f12", "")
+            result[code] = {
+                "name": item.get("f14", code),
+                "price": item.get("f2", 0),
+                "change_pct": item.get("f3", 0),
+                "change": item.get("f4", 0),
+            }
+        return result
     except Exception as e:
-        print(f"⚠️ Finnhub 请求失败 {endpoint}: {e}")
-        return None
+        print(f"⚠️ 东方财富行情请求失败: {e}")
+        return {}
 
 
-def _get_quote(symbol: str) -> dict:
-    """获取股票/ETF报价，返回 {price, change_pct, prev_close}"""
-    data = _finnhub("/quote", {"symbol": symbol})
-    if data and data.get("c"):
-        c = data["c"]
-        pc = data.get("pc", c)
-        change_pct = round((c - pc) / pc * 100, 2) if pc else 0
-        return {"price": c, "change_pct": change_pct, "prev_close": pc}
-    return None
+def _sina_indices(codes: str) -> dict:
+    """
+    新浪财经实时行情接口
+    codes: 逗号分隔，如 "s_sh000001,s_sz399001"
+    返回 {code: {"name": str, "price": float, "change_pct": float, ...}}
+    
+    新浪返回格式因品种不同而异：
+    - A股指数 (s_sh/s_sz): 名称,今开,昨收,现价,最高,最低,...
+    - 国际指数 (int_): 名称,现价,涨跌额,涨跌幅
+    - 期货 (hf_): 现价,昨收,...
+    - 外汇 (fx_): 时间,现价,昨收,...
+    """
+    url = f"https://hq.sinajs.cn/list={codes}"
+    try:
+        text = _http_get(url, referer="https://finance.sina.com.cn")
+        result = {}
+        for line in text.strip().split("\n"):
+            if not line.strip():
+                continue
+            m = re.search(r'hq_str_(\w+)="([^"]*)"', line)
+            if not m:
+                continue
+            key = m.group(1)
+            vals = m.group(2).split(",")
+            name = vals[0] if vals else ""
+            try:
+                if key.startswith("fx_"):
+                    # 外汇: 时间,现价,昨收,...
+                    price = float(vals[1]) if len(vals) > 1 and vals[1] else 0
+                    prev_close = float(vals[2]) if len(vals) > 2 and vals[2] else price
+                    change_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else 0
+                elif key.startswith("hf_"):
+                    # 期货: 现价(0),昨收(2),...
+                    price = float(vals[0]) if len(vals) > 0 and vals[0] else 0
+                    prev_close = float(vals[2]) if len(vals) > 2 and vals[2] else price
+                    change_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else 0
+                elif key.startswith("int_"):
+                    # 国际指数: 名称,现价,涨跌额,涨跌幅
+                    price = float(vals[1]) if len(vals) > 1 and vals[1] else 0
+                    change_pct = float(vals[3]) if len(vals) > 3 and vals[3] else 0
+                else:
+                    # A股/港股指数 (s_sh/s_sz): 名称,今开,昨收,现价,最高,最低,...
+                    price = float(vals[3]) if len(vals) > 3 and vals[3] else 0
+                    prev_close = float(vals[2]) if len(vals) > 2 and vals[2] else price
+                    change_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else 0
 
-
-def _get_forex_rate(base: str, target: str) -> float:
-    """获取外汇汇率"""
-    data = _finnhub("/forex/rates", {"base": base})
-    if data and "quote" in data:
-        return data["quote"].get(target, None)
-    return None
+                result[key] = {
+                    "name": name,
+                    "price": price,
+                    "change_pct": change_pct,
+                }
+            except (ValueError, IndexError):
+                pass
+        return result
+    except Exception as e:
+        print(f"⚠️ 新浪行情请求失败: {e}")
+        return {}
 
 
 def fetch_market_data() -> str:
     """
-    抓取实时市场行情数据，返回 Markdown 格式的数据块。
-    如果 Finnhub 不可用，返回空字符串（回退到 AI 估算）。
+    抓取实时市场行情数据（东方财富 + 新浪财经免费接口），
+    返回 Markdown 格式的数据块。
     """
-    if not FINNHUB_KEY:
-        print("⚠️ 未设置 FINNHUB_API_KEY，将使用 AI 估算数据")
+    print("📡 正在抓取实时行情（东方财富+新浪财经免费接口）...")
+    data_parts = []
+    usdcny_rate = None  # 供黄金换算用
+
+    # ============ 东方财富：A股指数 ============
+    em_a = _em_indices("1.000001,0.399001,0.399006,1.000300")
+    if em_a:
+        data_parts.append("### 🇨🇳 A股主要指数")
+        for code in ["000001", "399001", "399006", "000300"]:
+            d = em_a.get(code)
+            if d:
+                data_parts.append(
+                    f"- **{d['name']}**: {d['price']:.2f}，涨跌 {d['change_pct']:+.2f}%"
+                )
+        data_parts.append("")
+
+    # ============ 东方财富：港股指数 ============
+    em_hk = _em_indices("100.HSI,100.HSTECH")
+    if em_hk:
+        data_parts.append("### 🇭🇰 港股主要指数")
+        for code in ["HSI", "HSTECH"]:
+            d = em_hk.get(code)
+            if d:
+                data_parts.append(
+                    f"- **{d['name']}**: {d['price']:.2f}，涨跌 {d['change_pct']:+.2f}%"
+                )
+        data_parts.append("")
+
+    # ============ 新浪财经：美股指数 ============
+    sina_us = _sina_indices("int_dji,int_nasdaq,int_sp500")
+    if sina_us:
+        data_parts.append("### 🇺🇸 美股主要指数")
+        for key, label in [("int_dji", "道琼斯"), ("int_nasdaq", "纳斯达克"), ("int_sp500", "S&P500")]:
+            d = sina_us.get(key)
+            if d:
+                data_parts.append(
+                    f"- **{label}**: {d['price']:.2f}，涨跌 {d['change_pct']:+.2f}%"
+                )
+        data_parts.append("")
+
+    # ============ 新浪财经：商品期货 ============
+    sina_comm = _sina_indices("hf_CL,hf_OIL,hf_XAU")
+    if sina_comm:
+        data_parts.append("### 🛢️ 商品期货")
+
+        # WTI 原油
+        wti = sina_comm.get("hf_CL")
+        if wti:
+            data_parts.append(
+                f"- **WTI原油**: ${wti['price']:.2f}/桶，涨跌 {wti['change_pct']:+.2f}%"
+            )
+
+        # 布伦特原油
+        brent = sina_comm.get("hf_OIL")
+        if brent:
+            data_parts.append(
+                f"- **布伦特原油**: ${brent['price']:.2f}/桶，涨跌 {brent['change_pct']:+.2f}%"
+            )
+
+        # 伦敦金（美元/盎司）
+        gold = sina_comm.get("hf_XAU")
+        if gold:
+            data_parts.append(
+                f"- **伦敦金（现货）**: ${gold['price']:.2f}/盎司，涨跌 {gold['change_pct']:+.2f}%"
+            )
+        data_parts.append("")
+
+    # ============ 东方财富：国内黄金（人民币/克） ============
+    em_gold = _em_indices("118.AU9999")
+    if em_gold:
+        au = em_gold.get("AU9999")
+        if au:
+            data_parts.append("### 🥇 国内黄金")
+            data_parts.append(
+                f"- **黄金9999 (Au99.99)**: ¥{au['price']:.2f}/克，涨跌 {au['change_pct']:+.2f}%"
+            )
+            data_parts.append("")
+
+    # ============ 新浪财经：外汇 ============
+    sina_fx = _sina_indices("fx_susdcny,fx_susdjpy")
+    if sina_fx:
+        data_parts.append("### 💱 主要汇率")
+        usdcny = sina_fx.get("fx_susdcny")
+        if usdcny:
+            usdcny_rate = usdcny["price"]
+            data_parts.append(
+                f"- **美元/人民币**: {usdcny_rate:.4f}"
+            )
+        usdjpy = sina_fx.get("fx_susdjpy")
+        if usdjpy:
+            data_parts.append(
+                f"- **美元/日元**: {usdjpy['price']:.2f}"
+            )
+        data_parts.append("")
+
+    # ============ 东方财富：VIX 替代——用美股波动率相关 ============
+    # 新浪的 VIX 接口返回空，暂不添加（AI 可自行估算）
+
+    if not data_parts:
+        print("⚠️ 所有行情接口均无返回数据，将使用 AI 估算")
         return ""
 
-    print("📡 正在从 Finnhub 抓取实时行情...")
-    data_parts = []
-
-    # ---- 美股指数（通过 ETF 代理） ----
-    spy = _get_quote("SPY")      # S&P500
-    qqq = _get_quote("QQQ")      # 纳斯达克100
-    # ---- A股指数（通过 ETF 代理） ----
-    fxi = _get_quote("FXI")      # 中国大盘股 ETF（近似上证）
-    cnh = _get_quote("CNH")      # 近似创业板
-    # ---- 港股指数（通过 ETF 代理） ----
-    ewh = _get_quote("EWH")      # 香港 ETF（近似恒生）
-    # ---- 商品 ----
-    oil = _get_quote("USO")      # 美国原油 ETF（近似布伦特/原油）
-    vix = _get_quote("VIX")      # VIX 恐慌指数
-
-    # 黄金 - Finnhub 免费版不支持 OANDA:XAU_USD，用 GLD ETF 替代
-    gld = _get_quote("GLD")
-
-    # ---- 外汇 ----
-    usdcny = _get_forex_rate("USD", "CNY")
-    usdjpy = _get_forex_rate("USD", "JPY")
-
-    # ---- 组装数据 ----
-    data_parts.append("## 📡 实时行情数据（Finnhub，仅供参考）\n")
-
-    # 美股
-    if spy:
-        data_parts.append(f"- **S&P500 (SPY)**: ${spy['price']:.2f}，涨跌 {spy['change_pct']:+.2f}%")
-    if qqq:
-        data_parts.append(f"- **纳斯达克100 (QQQ)**: ${qqq['price']:.2f}，涨跌 {qqq['change_pct']:+.2f}%")
-
-    # A股
-    if fxi:
-        data_parts.append(f"- **中国大盘 (FXI)**: ${fxi['price']:.2f}，涨跌 {fxi['change_pct']:+.2f}%")
-
-    # 港股
-    if ewh:
-        data_parts.append(f"- **香港 (EWH)**: ${ewh['price']:.2f}，涨跌 {ewh['change_pct']:+.2f}%")
-
-    # 原油
-    if oil:
-        data_parts.append(f"- **原油 (USO)**: ${oil['price']:.2f}，涨跌 {oil['change_pct']:+.2f}%")
-
-    # 黄金
-    if gld:
-        gold_price_per_share = gld['price']
-        # GLD 每份约等于 0.1 盎司黄金，粗略换算
-        gold_usd_oz = round(gold_price_per_share * 10, 2)
-        data_parts.append(f"- **黄金 (GLD→估算)**: ${gold_usd_oz:.2f}/盎司，涨跌 {gld['change_pct']:+.2f}%")
-        if usdcny:
-            gold_rmb_g = round(gold_usd_oz * usdcny / 31.1035, 2)
-            data_parts.append(f"- **黄金 (人民币估算)**: ¥{gold_rmb_g:.2f}/克")
-
-    # VIX
-    if vix:
-        data_parts.append(f"- **VIX 恐慌指数**: {vix['price']:.2f}")
-
-    # 汇率
-    if usdcny:
-        data_parts.append(f"- **美元/人民币**: {usdcny:.4f}")
-    if usdjpy:
-        data_parts.append(f"- **美元/日元**: {usdjpy:.2f}")
-
-    data_parts.append("")  # 空行分隔
-
-    result = "\n".join(data_parts)
-    print(f"✅ 实时行情数据获取完成")
+    header = "## 📡 实时行情数据（东方财富+新浪财经免费接口）\n"
+    result = header + "\n".join(data_parts)
+    print(f"✅ 实时行情数据获取完成（{len(result)} 字符）")
     return result
 
 
@@ -353,7 +453,10 @@ def generate_report() -> str:
 
 你需要：
 1. 基于你对当前全球市场趋势的理解，分析今日最重要的10-12条新闻
-2. **重要：以下是实时行情数据，请基于这些真实数据填写"一、市场全景速览"表格，不要编造数据！**
+2. **重要：以下是来自东方财富和新浪财经的实时行情数据，请基于这些真实数据填写"一、市场全景速览"表格，不要编造数据！**
+   - A股指数（上证/深证/创业板/沪深300）和港股指数（恒生/恒生科技）来自东方财富
+   - 美股指数（道琼斯/纳斯达克/S&P500）、商品期货（原油/黄金美元）、外汇来自新浪财经
+   - 国内黄金人民币价格（Au99.99）来自东方财富上海金交所数据
 3. 区分国际新闻（🌍）和国内新闻（🇨🇳）
 4. 每一条新闻都要有详细的影响评估表格和受影响板块/个股
 5. 最后给出综合研判、风险提示、策略建议和事件日历

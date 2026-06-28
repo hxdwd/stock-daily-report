@@ -41,20 +41,94 @@ REPORT_FILE = os.path.join(OUTPUT_DIR, f"每日股市新闻分析报告_{TODAY}.
 # Markdown → HTML（与 main.py 中相同的渲染逻辑）
 # ============================================================
 
+def _is_table_separator(cells: list) -> bool:
+    """判断是否是 Markdown 表格的分隔行（如 |---|---| 或 |:---:|:---|）"""
+    return all(re.match(r"^:?-{3,}:?$", c) for c in cells)
+
+
+def _render_table_block(rows: list, html_lines: list):
+    """将收集到的表格行渲染为 HTML 表格"""
+    if len(rows) < 2:
+        return  # 至少需要表头+分隔行+一行数据
+    header_cells = rows[0]
+    # 跳过可能存在的多余分隔行
+    data_start = 1
+    if data_start < len(rows) and _is_table_separator(rows[data_start]):
+        data_start += 1
+    data_rows = rows[data_start:]
+
+    # 计算列数
+    col_count = len(header_cells)
+
+    html_lines.append(
+        '<table style="border-collapse:collapse;width:100%;margin:12px 0;font-size:14px;'
+        'table-layout:auto;word-break:break-word;">'
+    )
+    html_lines.append("<thead>")
+    html_lines.append("<tr>")
+    for cell in header_cells:
+        html_lines.append(
+            f'<th style="border:1px solid #ddd;padding:8px 10px;'
+            f'background:#2d3748;color:#fff;text-align:left;font-weight:600;'
+            f'white-space:nowrap;">{_inline_md(cell)}</th>'
+        )
+    html_lines.append("</tr>")
+    html_lines.append("</thead><tbody>")
+
+    for row in data_rows:
+        # 跳过空行或非表格行
+        if not row or all(c == "" for c in row):
+            continue
+        # 确保列数一致（补齐或截断）
+        while len(row) < col_count:
+            row.append("")
+        row = row[:col_count]
+        html_lines.append("<tr>")
+        for cell in row:
+            html_lines.append(
+                f'<td style="border:1px solid #ddd;padding:8px 10px;'
+                f'vertical-align:top;">{_inline_md(cell)}</td>'
+            )
+        html_lines.append("</tr>")
+
+    html_lines.append("</tbody></table>")
+
+
 def markdown_to_html(md_content: str) -> str:
     lines = md_content.split("\n")
     html_lines = []
-    in_table = False
     in_code_block = False
     in_ul = False
     in_ol = False
+    # 表格状态机：收集连续表格行，遇到非表格行时统一渲染
+    table_rows = []  # 收集表格的所有行（每行是 cell 列表）
+
+    def _flush_table():
+        """渲染并清空当前收集的表格行"""
+        nonlocal table_rows
+        if table_rows:
+            _render_table_block(table_rows, html_lines)
+            table_rows = []
+
+    def _flush_inline():
+        """关闭所有行内状态（列表等）"""
+        nonlocal in_ul, in_ol
+        if in_ul:
+            html_lines.append("</ul>")
+            in_ul = False
+        if in_ol:
+            html_lines.append("</ol>")
+            in_ol = False
 
     i = 0
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
 
+        # --- 代码块 ---
         if stripped.startswith("```"):
+            _flush_table()
+            _flush_inline()
             if in_code_block:
                 html_lines.append("</code></pre>")
                 in_code_block = False
@@ -73,62 +147,29 @@ def markdown_to_html(md_content: str) -> str:
             i += 1
             continue
 
+        # --- 表格行检测 ---
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [c.strip() for c in stripped[1:-1].split("|")]
+            # 先关闭列表状态
+            _flush_inline()
+            table_rows.append(cells)
+            i += 1
+            continue
+
+        # --- 非表格行：先 flush 表格 ---
+        _flush_table()
+
+        # --- 空行 ---
         if stripped == "":
-            if in_ul:
-                html_lines.append("</ul>")
-                in_ul = False
-            if in_ol:
-                html_lines.append("</ol>")
-                in_ol = False
-            if in_table and (i + 1 >= len(lines) or not lines[i + 1].strip().startswith("|")):
-                html_lines.append("</tbody></table>")
-                in_table = False
+            _flush_inline()
             html_lines.append("")
             i += 1
             continue
 
-        if stripped.startswith("|") and stripped.endswith("|"):
-            cells = [c.strip() for c in stripped[1:-1].split("|")]
-            if all(re.match(r"^:?-{3,}:?$", c) for c in cells):
-                i += 1
-                continue
-            if not in_table:
-                html_lines.append(
-                    '<table style="border-collapse:collapse;width:100%;margin:12px 0;font-size:14px;">'
-                )
-                html_lines.append("<thead>")
-                in_table = True
-                is_header = True
-            else:
-                is_header = False
-
-            if is_header:
-                html_lines.append("<tr>")
-                for cell in cells:
-                    html_lines.append(
-                        f'<th style="border:1px solid #ddd;padding:8px 12px;'
-                        f'background:#2d3748;color:#fff;text-align:left;font-weight:600;">'
-                        f'{_inline_md(cell)}</th>'
-                    )
-                html_lines.append("</tr>")
-                html_lines.append("</thead><tbody>")
-            else:
-                html_lines.append("<tr>")
-                for cell in cells:
-                    html_lines.append(
-                        f'<td style="border:1px solid #ddd;padding:8px 12px;'
-                        f'vertical-align:top;">{_inline_md(cell)}</td>'
-                    )
-                html_lines.append("</tr>")
-            i += 1
-            continue
-
-        if in_table:
-            html_lines.append("</tbody></table>")
-            in_table = False
-
+        # --- 标题 ---
         h_match = re.match(r"^(#{1,6})\s+(.*)", line)
         if h_match:
+            _flush_inline()
             level = len(h_match.group(1))
             text = _inline_md(h_match.group(2))
             sizes = {1: 28, 2: 24, 3: 20, 4: 18, 5: 16, 6: 15}
@@ -143,6 +184,7 @@ def markdown_to_html(md_content: str) -> str:
             i += 1
             continue
 
+        # --- 无序列表 ---
         ul_match = re.match(r"^(\s*)[-*+]\s+(.*)", line)
         if ul_match:
             if not in_ul:
@@ -155,6 +197,7 @@ def markdown_to_html(md_content: str) -> str:
             i += 1
             continue
 
+        # --- 有序列表 ---
         ol_match = re.match(r"^(\s*)\d+\.\s+(.*)", line)
         if ol_match:
             if not in_ol:
@@ -167,6 +210,7 @@ def markdown_to_html(md_content: str) -> str:
             i += 1
             continue
 
+        # --- 引用块 ---
         if stripped.startswith(">"):
             quote_text = re.sub(r"^>\s?", "", stripped)
             html_lines.append(
@@ -177,6 +221,7 @@ def markdown_to_html(md_content: str) -> str:
             i += 1
             continue
 
+        # --- 分隔线 ---
         if stripped in ("---", "***", "___"):
             html_lines.append(
                 '<hr style="border:none;border-top:2px solid #e2e8f0;margin:24px 0;">'
@@ -184,18 +229,16 @@ def markdown_to_html(md_content: str) -> str:
             i += 1
             continue
 
+        # --- 普通段落 ---
         html_lines.append(
             f'<p style="margin:8px 0;line-height:1.8;color:#4a5568;">'
             f'{_inline_md(stripped)}</p>'
         )
         i += 1
 
-    if in_ul:
-        html_lines.append("</ul>")
-    if in_ol:
-        html_lines.append("</ol>")
-    if in_table:
-        html_lines.append("</tbody></table>")
+    # 收尾：flush 所有未关闭的状态
+    _flush_table()
+    _flush_inline()
     if in_code_block:
         html_lines.append("</code></pre>")
 

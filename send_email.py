@@ -15,9 +15,15 @@ from datetime import datetime, timezone, timedelta
 
 # 北京时间
 TZ = timezone(timedelta(hours=8))
-TODAY = datetime.now(TZ).strftime("%Y%m%d")
-TODAY_CN = datetime.now(TZ).strftime("%Y年%m月%d日")
-TODAY_WEEKDAY = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.now(TZ).weekday()]
+_now = datetime.now(TZ)
+
+def _fmt_cn(dt: datetime) -> str:
+    """跨平台中文日期格式化，避免 Windows strftime 编码问题"""
+    return f"{dt.year}年{dt.month:02d}月{dt.day:02d}日"
+
+TODAY = _now.strftime("%Y%m%d")
+TODAY_CN = _fmt_cn(_now)
+TODAY_WEEKDAY = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][_now.weekday()]
 
 # 邮件配置
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")

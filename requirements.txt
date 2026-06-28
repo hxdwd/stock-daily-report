@@ -1,3 +1,4 @@
 # 每日股市新闻分析报告 - 依赖
-# 本项目使用 Python 标准库（urllib, smtplib, email），无需额外安装第三方依赖
+# 本项目使用 Python 标准库（urllib, smtplib, email, json, re），无需额外安装第三方依赖
+# 实时行情数据通过 Finnhub REST API 获取（urllib），无需 SDK
 # 此文件保留用于 GitHub Actions 的 pip install 步骤

@@ -3,7 +3,7 @@
 ==============================================
 每天自动搜索最新国内外财经新闻，调用 AI API 生成结构化分析报告。
 运行方式：python main.py [--send-email]
-依赖环境变量：AI_API_KEY, AI_API_BASE (可选), AI_MODEL (可选)
+依赖环境变量：AI_API_KEY, AI_API_BASE (可选), AI_MODEL (可选), FINNHUB_API_KEY
 邮件发送需要：SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_TO
 """
 
@@ -32,6 +32,10 @@ API_KEY = os.environ.get("AI_API_KEY", "")
 API_BASE = os.environ.get("AI_API_BASE", "https://api.openai.com/v1")
 API_MODEL = os.environ.get("AI_MODEL", "gpt-4o")
 
+# Finnhub 实时行情配置
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+
 # 邮件配置
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -43,6 +47,130 @@ EMAIL_TO = os.environ.get("EMAIL_TO", "")
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, f"每日股市新闻分析报告_{TODAY}.md")
 MEMORY_FILE = os.path.join(OUTPUT_DIR, ".codebuddy", "automations", "automation", "memory.md")
+
+
+# ============================================================
+# Finnhub 实时行情数据抓取
+# ============================================================
+
+def _finnhub(endpoint: str, params: dict = None) -> dict:
+    """调用 Finnhub API"""
+    if not FINNHUB_KEY:
+        return None
+    url = f"{FINNHUB_BASE}{endpoint}?token={FINNHUB_KEY}"
+    if params:
+        for k, v in params.items():
+            url += f"&{k}={v}"
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"⚠️ Finnhub 请求失败 {endpoint}: {e}")
+        return None
+
+
+def _get_quote(symbol: str) -> dict:
+    """获取股票/ETF报价，返回 {price, change_pct, prev_close}"""
+    data = _finnhub("/quote", {"symbol": symbol})
+    if data and data.get("c"):
+        c = data["c"]
+        pc = data.get("pc", c)
+        change_pct = round((c - pc) / pc * 100, 2) if pc else 0
+        return {"price": c, "change_pct": change_pct, "prev_close": pc}
+    return None
+
+
+def _get_forex_rate(base: str, target: str) -> float:
+    """获取外汇汇率"""
+    data = _finnhub("/forex/rates", {"base": base})
+    if data and "quote" in data:
+        return data["quote"].get(target, None)
+    return None
+
+
+def fetch_market_data() -> str:
+    """
+    抓取实时市场行情数据，返回 Markdown 格式的数据块。
+    如果 Finnhub 不可用，返回空字符串（回退到 AI 估算）。
+    """
+    if not FINNHUB_KEY:
+        print("⚠️ 未设置 FINNHUB_API_KEY，将使用 AI 估算数据")
+        return ""
+
+    print("📡 正在从 Finnhub 抓取实时行情...")
+    data_parts = []
+
+    # ---- 美股指数（通过 ETF 代理） ----
+    spy = _get_quote("SPY")      # S&P500
+    qqq = _get_quote("QQQ")      # 纳斯达克100
+    # ---- A股指数（通过 ETF 代理） ----
+    fxi = _get_quote("FXI")      # 中国大盘股 ETF（近似上证）
+    cnh = _get_quote("CNH")      # 近似创业板
+    # ---- 港股指数（通过 ETF 代理） ----
+    ewh = _get_quote("EWH")      # 香港 ETF（近似恒生）
+    # ---- 商品 ----
+    oil = _get_quote("USO")      # 美国原油 ETF（近似布伦特/原油）
+    vix = _get_quote("VIX")      # VIX 恐慌指数
+
+    # 黄金 - Finnhub 免费版不支持 OANDA:XAU_USD，用 GLD ETF 替代
+    gld = _get_quote("GLD")
+
+    # ---- 外汇 ----
+    usdcny = _get_forex_rate("USD", "CNY")
+    usdjpy = _get_forex_rate("USD", "JPY")
+
+    # ---- 组装数据 ----
+    data_parts.append("## 📡 实时行情数据（Finnhub，仅供参考）\n")
+
+    # 美股
+    if spy:
+        data_parts.append(f"- **S&P500 (SPY)**: ${spy['price']:.2f}，涨跌 {spy['change_pct']:+.2f}%")
+    if qqq:
+        data_parts.append(f"- **纳斯达克100 (QQQ)**: ${qqq['price']:.2f}，涨跌 {qqq['change_pct']:+.2f}%")
+
+    # A股
+    if fxi:
+        data_parts.append(f"- **中国大盘 (FXI)**: ${fxi['price']:.2f}，涨跌 {fxi['change_pct']:+.2f}%")
+
+    # 港股
+    if ewh:
+        data_parts.append(f"- **香港 (EWH)**: ${ewh['price']:.2f}，涨跌 {ewh['change_pct']:+.2f}%")
+
+    # 原油
+    if oil:
+        data_parts.append(f"- **原油 (USO)**: ${oil['price']:.2f}，涨跌 {oil['change_pct']:+.2f}%")
+
+    # 黄金
+    if gld:
+        gold_price_per_share = gld['price']
+        # GLD 每份约等于 0.1 盎司黄金，粗略换算
+        gold_usd_oz = round(gold_price_per_share * 10, 2)
+        data_parts.append(f"- **黄金 (GLD→估算)**: ${gold_usd_oz:.2f}/盎司，涨跌 {gld['change_pct']:+.2f}%")
+        if usdcny:
+            gold_rmb_g = round(gold_usd_oz * usdcny / 31.1035, 2)
+            data_parts.append(f"- **黄金 (人民币估算)**: ¥{gold_rmb_g:.2f}/克")
+
+    # VIX
+    if vix:
+        data_parts.append(f"- **VIX 恐慌指数**: {vix['price']:.2f}")
+
+    # 汇率
+    if usdcny:
+        data_parts.append(f"- **美元/人民币**: {usdcny:.4f}")
+    if usdjpy:
+        data_parts.append(f"- **美元/日元**: {usdjpy:.2f}")
+
+    data_parts.append("")  # 空行分隔
+
+    result = "\n".join(data_parts)
+    print(f"✅ 实时行情数据获取完成")
+    return result
+
+
+# ============================================================
+# AI API 调用
+# ============================================================
 
 # ============================================================
 # AI API 调用
@@ -212,14 +340,19 @@ def generate_report() -> str:
 
 请现在开始生成 {TODAY_CN} 的分析报告。"""
 
+    # 抓取实时行情数据
+    market_data = fetch_market_data()
+
     user_prompt = f"""请为 {TODAY_CN}（{TODAY_WEEKDAY}）生成一份完整的每日股市新闻分析报告。
 
 你需要：
 1. 基于你对当前全球市场趋势的理解，分析今日最重要的10-12条新闻
-2. 包含市场数据（指数点位、商品价格等），尽可能准确
+2. **重要：以下是实时行情数据，请基于这些真实数据填写"一、市场全景速览"表格，不要编造数据！**
 3. 区分国际新闻（🌍）和国内新闻（🇨🇳）
 4. 每一条新闻都要有详细的影响评估表格和受影响板块/个股
 5. 最后给出综合研判、风险提示、策略建议和事件日历
+
+{market_data}
 
 请直接输出完整报告，不要有任何开头语或结尾语。"""
 

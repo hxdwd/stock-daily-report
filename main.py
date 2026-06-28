@@ -532,6 +532,9 @@ def post_process_report(report: str) -> str:
         cleaned_lines.append(line)
     report = '\n'.join(cleaned_lines)
 
+    # ========== 关键修复：将表格内的"受影响板块/个股"行提取到表格下方 ==========
+    report = _extract_affected_stocks_from_tables(report)
+
     # 确保免责声明存在
     if "免责声明" not in report:
         report += f"\n\n---\n\n> 📝 **免责声明：** 本报告基于公开信息与AI分析生成，不构成投资建议。股市有风险，投资需谨慎。\n\n---\n\n*报告生成时间：{TODAY_CN} (自动化) CST*  \n*下一份报告预计：明日*"
@@ -541,6 +544,92 @@ def post_process_report(report: str) -> str:
         report += f"\n\n---\n\n*报告生成时间：{TODAY_CN} (自动化) CST*"
 
     return report
+
+
+def _extract_affected_stocks_from_tables(report: str) -> str:
+    """
+    自动检测表格中包含"受影响"关键字的行，将其从表格中移出，
+    转换为表格下方的列表格式。
+    """
+    lines = report.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # 检测是否是包含"受影响"的表格行
+        if stripped.startswith('|') and ('受影响' in stripped):
+            # 这是需要从表格中提取的行
+            # 解析单元格内容（去掉首尾的 |）
+            cells = [c.strip() for c in stripped[1:].rstrip('|').split('|')]
+
+            # 收集所有非空的单元格内容（跳过第一列通常是"受影响的美股板块/个股"）
+            stock_parts = []
+            for cell in cells:
+                cell = cell.strip()
+                if cell and '受影响' not in cell:
+                    # 解析利好/利空分组
+                    stock_parts.append(cell)
+
+            # 尝试从内容中拆分利好和利空
+            combined = ' '.join(stock_parts)
+            # 提取各种分组：利好、利空、防御、避险、敏感 等
+            stock_list_lines = []
+            # 按常见关键词拆分
+            segments = re.split(r'(\*\*(?:利好|利空|防御|避险|敏感|中性)\*\*)', combined)
+            current_label = None
+            for seg in segments:
+                seg = seg.strip()
+                if not seg:
+                    continue
+                if re.match(r'^\*\*(?:利好|利空|防御|避险|敏感|中性)\*\*$', seg):
+                    current_label = seg
+                elif current_label and seg:
+                    # 提取个股代码
+                    tickers = re.findall(r'`([A-Z]+)`', seg)
+                    names = re.findall(r'\(([^)]+)\)', seg)
+                    # 配对ticker和name
+                    items = []
+                    for j, ticker in enumerate(tickers):
+                        name = names[j] if j < len(names) else ''
+                        items.append(f'`{ticker}`{f"（{name}）" if name else ""}')
+                    if items:
+                        # 根据标签选择emoji
+                        emoji = '🟢' if '利好' in current_label else ('🔴' if '利空' in current_label else '🛡️' if '防御' in current_label else '🟡')
+                        stock_list_lines.append(f"- {emoji} {current_label}：{'、'.join(items)}")
+
+            # 输出到结果：结束当前表格，输出列表，然后继续
+            # 需要找到并关闭当前表格的标记
+            # 策略：删除当前行，在下一行插入列表
+
+            # 检查上一行是否是表格分隔行，如果是也要移除
+            if result and result[-1].strip().startswith('|') and '---' in result[-1]:
+                # 上一行是分隔行，检查上上行是否是表格行
+                pass  # 不删除分隔行，只删除当前受影响行
+
+            # 不添加当前行到 result（即删除表格中的受影响行）
+            # 但需要在表格关闭后添加列表
+            # 找到下一个非表格行，在那里插入
+            lookahead = i + 1
+            while lookahead < len(lines) and lines[lookahead].strip().startswith('|'):
+                lookahead += 1
+
+            # 如果表格还有后续行，先关闭表格再添加列表
+            # 但我们不能修改还没处理的行，所以用标记法：
+            # 把列表追加到 result 末尾，后续遇到空行时会自然分隔
+            if stock_list_lines:
+                result.append('')  # 空行确保表格结束
+                result.extend(stock_list_lines)
+                result.append('')
+
+            i += 1
+            continue
+
+        result.append(line)
+        i += 1
+
+    return '\n'.join(result)
 
 
 # ============================================================

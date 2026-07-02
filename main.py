@@ -198,8 +198,21 @@ def fetch_market_data():
                 structured[d['name']] = {"price": d['price'], "change_pct": d['change_pct']}
         data_parts.append("")
 
-    # ============ 东方财富：美股指数（已验证数据准确，优于新浪）============
+    # ============ 美股指数（东方财富优先，新浪财经备用）============
     em_us = _em_indices("100.DJIA,100.NDX,100.SPX")
+    if not em_us:
+        # 东方财富接口可能在某些网络环境失败，用新浪国际指数兜底
+        # int_dji=道琼斯, int_nasdaq=纳斯达克, int_sp500=标普500
+        sina_us = _sina_indices("int_dji,int_nasdaq,int_sp500")
+        if sina_us:
+            em_us = {
+                "DJIA": {"name": "道琼斯", "price": sina_us.get("int_dji", {}).get("price", 0), "change_pct": sina_us.get("int_dji", {}).get("change_pct", 0)},
+                "NDX":  {"name": "纳斯达克", "price": sina_us.get("int_nasdaq", {}).get("price", 0), "change_pct": sina_us.get("int_nasdaq", {}).get("change_pct", 0)},
+                "SPX":  {"name": "标普500", "price": sina_us.get("int_sp500", {}).get("price", 0), "change_pct": sina_us.get("int_sp500", {}).get("change_pct", 0)},
+            }
+            # 清理掉价格为0的空数据
+            em_us = {k: v for k, v in em_us.items() if v["price"] > 0}
+
     if em_us:
         data_parts.append("### 🇺🇸 美股主要指数")
         for code, label in [("DJIA", "道琼斯工业"), ("NDX", "纳斯达克综合"), ("SPX", "标普500")]:

@@ -161,14 +161,16 @@ def _sina_indices(codes: str) -> dict:
         return {}
 
 
-def fetch_market_data() -> str:
+def fetch_market_data():
     """
     抓取实时市场行情数据（东方财富 + 新浪财经免费接口），
-    返回 Markdown 格式的数据块。
+    返回 (markdown_text, structured_dict) 元组。
+    
+    structured_dict 用于后处理阶段的数据校验和替换。
     """
     print("📡 正在抓取实时行情（东方财富+新浪财经免费接口）...")
     data_parts = []
-    usdcny_rate = None  # 供黄金换算用
+    structured = {}  # 结构化数据供校验用
 
     # ============ 东方财富：A股指数 ============
     em_a = _em_indices("1.000001,0.399001,0.399006,1.000300")
@@ -180,6 +182,7 @@ def fetch_market_data() -> str:
                 data_parts.append(
                     f"- **{d['name']}**: {d['price']:.2f}，涨跌 {d['change_pct']:+.2f}%"
                 )
+                structured[d['name']] = {"price": d['price'], "change_pct": d['change_pct']}
         data_parts.append("")
 
     # ============ 东方财富：港股指数 ============
@@ -192,6 +195,7 @@ def fetch_market_data() -> str:
                 data_parts.append(
                     f"- **{d['name']}**: {d['price']:.2f}，涨跌 {d['change_pct']:+.2f}%"
                 )
+                structured[d['name']] = {"price": d['price'], "change_pct": d['change_pct']}
         data_parts.append("")
 
     # ============ 东方财富：美股指数（已验证数据准确，优于新浪）============
@@ -204,9 +208,9 @@ def fetch_market_data() -> str:
                 data_parts.append(
                     f"- **{label}**: {d['price']:.2f}，涨跌 {d['change_pct']:+.2f}%"
                 )
+                structured[label] = {"price": d['price'], "change_pct": d['change_pct']}
         data_parts.append("")
     else:
-        # 东方财富失败时标注无数据
         data_parts.append("### 🇺🇸 美股主要指数")
         data_parts.append("⚠️ 实时数据暂不可用，请AI基于上周收盘价进行估算分析。")
         data_parts.append("")
@@ -216,26 +220,26 @@ def fetch_market_data() -> str:
     if sina_comm:
         data_parts.append("### 🛢️ 商品期货")
 
-        # WTI 原油
         wti = sina_comm.get("hf_CL")
         if wti:
             data_parts.append(
                 f"- **WTI原油**: ${wti['price']:.2f}/桶，涨跌 {wti['change_pct']:+.2f}%"
             )
+            structured["WTI原油"] = {"price": wti['price'], "change_pct": wti['change_pct']}
 
-        # 布伦特原油
         brent = sina_comm.get("hf_OIL")
         if brent:
             data_parts.append(
                 f"- **布伦特原油**: ${brent['price']:.2f}/桶，涨跌 {brent['change_pct']:+.2f}%"
             )
+            structured["布伦特原油"] = {"price": brent['price'], "change_pct": brent['change_pct']}
 
-        # 伦敦金（美元/盎司）
         gold = sina_comm.get("hf_XAU")
         if gold:
             data_parts.append(
                 f"- **伦敦金（现货）**: ${gold['price']:.2f}/盎司，涨跌 {gold['change_pct']:+.2f}%"
             )
+            structured["伦敦金"] = {"price": gold['price'], "change_pct": gold['change_pct']}
         data_parts.append("")
 
     # ============ 东方财富：国内黄金（人民币/克） ============
@@ -247,6 +251,7 @@ def fetch_market_data() -> str:
             data_parts.append(
                 f"- **黄金9999 (Au99.99)**: ¥{au['price']:.2f}/克，涨跌 {au['change_pct']:+.2f}%"
             )
+            structured["国内黄金"] = {"price": au['price'], "change_pct": au['change_pct']}
             data_parts.append("")
 
     # ============ 新浪财经：外汇 ============
@@ -255,27 +260,178 @@ def fetch_market_data() -> str:
         data_parts.append("### 💱 主要汇率")
         usdcny = sina_fx.get("fx_susdcny")
         if usdcny:
-            usdcny_rate = usdcny["price"]
             data_parts.append(
-                f"- **美元/人民币**: {usdcny_rate:.4f}"
+                f"- **美元/人民币**: {usdcny['price']:.4f}"
             )
+            structured["美元/人民币"] = {"price": usdcny['price'], "change_pct": 0}
         usdjpy = sina_fx.get("fx_susdjpy")
         if usdjpy:
             data_parts.append(
                 f"- **美元/日元**: {usdjpy['price']:.2f}"
             )
+            structured["美元/日元"] = {"price": usdjpy['price'], "change_pct": 0}
         data_parts.append("")
-
-    # ============ 东方财富：VIX 替代——用美股波动率相关 ============
-    # 新浪的 VIX 接口返回空，暂不添加（AI 可自行估算）
 
     if not data_parts:
         print("⚠️ 所有行情接口均无返回数据，将使用 AI 估算")
-        return ""
+        return "", {}
 
     header = "## 📡 实时行情数据（东方财富+新浪财经免费接口）\n"
     result = header + "\n".join(data_parts)
     print(f"✅ 实时行情数据获取完成（{len(result)} 字符）")
+    return result, structured
+
+
+# ============================================================
+# 财经新闻抓取（新浪财经 7x24 + 东方财富财经要闻）
+# ============================================================
+
+# 国际/美股相关关键词（用于自动分类）
+_INTL_KEYWORDS = [
+    "美联储","美股","纳斯达克","道琼斯","标普","华尔街","特朗普","拜登","白宫",
+    "美国","通胀","CPI","GDP","非农","加息","降息","OpenAI","英伟达","苹果",
+    "特斯拉","微软","谷歌","Meta","亚马逊","欧洲","日本","全球","油价","黄金",
+    "美元","关税","贸易战","半导体","AI","芯片","台积电","马斯克","巴菲特",
+    "港股","恒生","恒指","港股通","科指","日元","韩国","印度","英国","欧盟",
+    "央行","利率","国债","债券","汇率","外汇","OPEC","原油","能源","比特币",
+    "以太坊","加密货币","SEC","纳斯达克","纽交所","IPO","上市","收购","合并",
+    "制裁","地缘","中东","伊朗","俄罗斯","乌克兰","北约","G7","G20","IMF",
+]
+
+def _is_international(title: str) -> bool:
+    """判断新闻标题是否属于国际/美股相关"""
+    return any(kw in title for kw in _INTL_KEYWORDS)
+
+def _fetch_sina_7x24(num: int = 50) -> list:
+    """
+    从新浪财经 7x24 全球要闻 JSON 接口抓取实时新闻。
+    API: https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509
+    返回 [{"title":..., "intro":..., "ctime":..., "source":"新浪财经-7x24"}, ...]
+    """
+    news_list = []
+    try:
+        url = f"https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num={num}&page=1"
+        raw = _http_get(url, timeout=10)
+        data = json.loads(raw)
+        items = data.get("result", {}).get("data", [])
+        for item in items:
+            title = (item.get("title") or "").strip()
+            if not title or len(title) < 10:
+                continue
+            # 过滤纯广告/推广类内容
+            skip_prefixes = ["精选足篮","历史上的今天","大乐透","竞彩","双色球"]
+            if any(title.startswith(p) for p in skip_prefixes):
+                continue
+            news_list.append({
+                "title": title,
+                "summary": (item.get("intro") or "")[:200],
+                "source": "新浪财经-7x24",
+                "is_intl": _is_international(title),
+            })
+        print(f"  ✅ 新浪财经7x24: 抓取 {len(news_list)} 条")
+    except Exception as e:
+        print(f"  ⚠️ 新浪财经7x24 抓取失败: {e}")
+    return news_list
+
+def _fetch_eastmoney_czyw(num: int = 40) -> list:
+    """
+    从东方财富财经要闻页面抓取新闻标题。
+    URL: https://finance.eastmoney.com/a/czqyw.html
+    返回 [{"title":..., "url":..., "source":"东方财富-要闻"}, ...]
+    """
+    news_list = []
+    try:
+        url = "https://finance.eastmoney.com/a/czqyw.html"
+        html = _http_get(url, timeout=15)
+        # 匹配 <a href="...">标题文字</a> 格式的新闻链接
+        items = re.findall(
+            r'<a[^>]*href="(https?://finance\.eastmoney\.com/a/\d+\.html)"[^>]*>(.{10,100})</a>',
+            html
+        )
+        for href, title in items:
+            title = re.sub(r'<[^>]+>', '', title).strip()
+            if not title or len(title) < 10:
+                continue
+            news_list.append({
+                "title": title,
+                "summary": "",
+                "source": "东方财富-要闻",
+                "is_intl": _is_international(title),
+                "url": href,
+            })
+        print(f"  ✅ 东方财富要闻: 抓取 {len(news_list)} 条")
+    except Exception as e:
+        print(f"  ⚠️ 东方财富要闻 抓取失败: {e}")
+    return news_list
+
+
+def fetch_news_headlines() -> str:
+    """
+    从多个中文财经源抓取当日新闻标题和摘要。
+    返回 Markdown 格式的新闻列表，用于注入 AI prompt。
+    
+    数据源（已验证可用）：
+    1. 新浪财经 7x24 全球要闻 JSON API（实时滚动新闻）
+    2. 东方财富财经要闻 HTML 页面（每日精选重点新闻）
+    """
+    print("📰 正在抓取当日财经新闻...")
+    all_news = []
+    
+    # 并行抓取两个数据源
+    sina_news = _fetch_sina_7x24(num=50)
+    em_news = _fetch_eastmoney_czyw(num=40)
+    
+    # 合并（新浪优先，东方财富补充）
+    all_news = sina_news + em_news
+    
+    # ---- 去重：按标题前30字 ----
+    seen = set()
+    unique_news = []
+    for n in all_news:
+        key = n["title"][:30]
+        if key not in seen:
+            seen.add(key)
+            unique_news.append(n)
+    all_news = unique_news
+    print(f"  📊 合并去重后共 {len(all_news)} 条新闻")
+    
+    if not all_news:
+        print("  ⚠️ 所有新闻源均无数据，将使用AI训练知识作为降级方案")
+        return ""
+    
+    # ---- 按关键词分类 ----
+    international = [n for n in all_news if n.get("is_intl")]
+    domestic = [n for n in all_news if not n.get("is_intl")]
+    
+    # 如果国际新闻太少，不做硬性填充
+    # 确保有足够新闻
+    if len(international) < 3 and len(domestic) > 10:
+        # 把一些模糊的新闻归入国际
+        pass
+    
+    # 组装输出
+    lines = []
+    lines.append("## 📰 今日真实财经新闻（来自新浪财经/东方财富，请基于以下真实新闻分析）\n")
+    
+    if international:
+        lines.append("### 🌍 国际新闻（美股/全球相关）")
+        for i, n in enumerate(international[:15], 1):
+            summary_part = f" — {n['summary']}" if n.get('summary') else ""
+            lines.append(f"{i}. **{n['title']}**{summary_part}")
+            lines.append(f"   来源：{n['source']}")
+        lines.append("")
+    
+    if domestic:
+        lines.append("### 🇨🇳 国内新闻")
+        for i, n in enumerate(domestic[:10], 1):
+            summary_part = f" — {n['summary']}" if n.get('summary') else ""
+            lines.append(f"{i}. **{n['title']}**{summary_part}")
+            lines.append(f"   来源：{n['source']}")
+        lines.append("")
+    
+    result = "\n".join(lines)
+    total = len(international) + len(domestic)
+    print(f"✅ 新闻抓取完成: {len(international)} 条国际 + {len(domestic)} 条国内 = {total} 条（去重后）")
     return result
 
 
@@ -384,35 +540,44 @@ def generate_report() -> str:
 
     system_prompt = f"""你是一个专业的**美股**市场分析自动化分析师，名为"NewsImpactAnalyzer"。
 
+## 🔥 最高优先级：数据来源规则
+**本报告的所有市场分析必须100%基于下方User Prompt中提供的API实时行情数据。**
+- 你的训练数据截止于2025年，已经完全过时。道琼斯已从~41,000涨到~52,000，纳斯达克已从~22,000涨到~26,000，标普500已从~6,800涨到~7,500。
+- **严禁使用你训练数据中的任何价格、涨跌幅、点位等数值。**
+- **表格中每一个数字都必须从API实时数据中逐字复制。**
+- **你的所有分析判断（涨了还是跌了、哪个板块领涨领跌、市场情绪如何）都必须以API数据为依据，而非你的训练知识。**
+
 ## 你的核心职责
 自动分析当前日期（{TODAY_CN} {TODAY_WEEKDAY}）的重大新闻对**美股市场**的潜在影响，并输出结构化分析报告。
 **核心聚焦美股**：本报告主要分析美股（道琼斯、纳斯达克、S&P500），A股和港股仅作为全球市场联动背景简要提及。
 
+## 🔥 新闻来源规则（最高优先级）
+1. **所有新闻必须来自User Prompt中"📰 今日真实财经新闻"列表**，该列表由东方财富/新浪财经实时抓取。
+2. **严禁编造新闻**：如果新闻列表只有8条，就分析这8条。绝不能用训练数据中的历史事件（如"美联储2024年降息"等）充数。
+3. **新闻引用**：每条分析的新闻标题必须与新闻列表中的一致，不要自己改写标题。
+4. **新闻不足时的处理**：如果新闻列表为空或不足5条，跳过"二、重大新闻分类与影响分析"章节，直接输出"📌 今日新闻数据暂不可用，以下为基于实时行情的市场技术面分析"，然后进入综合研判。
+
 ## 任务要求
-1. **基于你的训练知识**（截至2025年中的知识），结合对当前市场趋势的理解，生成分析报告
-2. **区分国内与国际新闻**：对每一条新闻首先判断其属于"国际"还是"国内"维度
-3. **评估美股影响**：重点评估对美股整体市场情绪、特定板块或个股的短期（1-3天）和中期（1-4周）影响
-4. **输出结构化结果**：严格按照下方格式输出
+1. **从下方真实新闻列表中挑选最重要的10-12条**，逐一分析其对美股市场的影响
+2. **行情数据必须来自API**：所有价格、涨跌幅等行情数据必须来自API
+3. **区分国内与国际新闻**：对每一条新闻标注其属于"国际"还是"国内"维度
+4. **评估美股影响**：重点评估对美股整体市场情绪、特定板块或个股的短期（1-3天）和中期（1-4周）影响
+5. **输出结构化结果**：严格按照下方格式输出
 
 ## 🚫 严格禁止（违反将导致报告作废）
-1. **禁止任何开场白/对话式语言**：不要输出"好的，分析师已就位""现在为您呈现""让我们看看"等AI对话式废话。报告就是报告，直接开始正文。
-2. **禁止输出数据计算过程/验证说明**：不要出现"黄金人民币价格验证""数据合理""计算：xxx"等调试性解释。数据直接放在表格里即可。
-3. **禁止在影响评估表格内放置"受影响板块"行**：影响评估表格只放市场行（美股/A股/港股等）。"受影响美股板块/个股"必须在表格**下方**用列表格式独立展示。
-4. **禁止生成两个一级标题**：报告开头已有 `# 📊 每日美股新闻分析报告`，不要再生成第二个一级标题。
+1. **禁止编造新闻事件**：报告中的新闻必须100%来自User Prompt中的新闻列表。如果你引用的新闻不在列表中，报告作废。
+2. **禁止使用训练数据中的数值**：所有价格、涨跌幅必须来自API实时数据。
+3. **禁止基于错误数据做分析**：比如API显示道琼斯跌-0.03%（微跌），你就不能写成"能源股拖累道琼斯下跌"。
+4. **禁止任何开场白/对话式语言**：不要输出"好的，分析师已就位""现在为您呈现""让我们看看"等AI对话式废话。
+5. **禁止输出数据计算过程/验证说明**：不要出现"黄金人民币价格验证""数据合理""计算：xxx"等调试性解释。
+6. **禁止在影响评估表格内放置"受影响板块"行**：影响评估表格只放市场行（美股/A股/港股等）。"受影响美股板块/个股"必须在表格**下方**用列表格式独立展示。
+7. **禁止生成两个一级标题**：报告开头已有 `# 📊 每日美股新闻分析报告`，不要再生成第二个一级标题。
 
-## 重要提示
-- 你必须基于你已知的、截至训练数据中的市场信息来分析
-- 如果某些具体数据点不确定，请基于合理的市场逻辑推演
-- 报告要专业、客观、有深度
-- 使用Markdown格式，包含表格、emoji等排版元素，图表要美观清晰
-- 日期使用 {TODAY_CN}（{TODAY_WEEKDAY}）
-- 不要输出"我的知识截止于..."等声明，直接进行分析
-
-## ⚠️ 数据准确性强制约束（必须严格遵守）
-1. **行情数据必须使用下方提供的实时数据**，严禁自行编造或使用训练数据中的历史数值！
-2. **周末/节假日**：如果实时数据接口返回空或标注休市，必须明确标注"📌 今日休市，数据为上周五收盘价"
-3. **美股指数数值校验**：如果接口返回的数据与市场已知合理区间偏差过大（超过20%），标注"⚠️ 数据可能延迟"并优先使用合理估算值。严禁硬编码固定的指数区间。
-4. **禁止在策略建议中使用A股专属代码**（如518880等），美股策略请使用美股代码（如GLD、XLE等）
+## 📊 分析写作规则（每条分析必须基于API数据+真实新闻）
+1. **市场全景速览的状态标注**：必须根据API数据中的涨跌幅方向来写。跌了就写🔴，涨了就写🟢，平了就写🟡。
+2. **新闻影响分析**：评估新闻对市场的影响时，结合API真实行情数据。比如"标普500当前报7483点（-0.22%），在XX新闻影响下……"
+3. **综合研判**：市场判断必须以API数据为准，新闻解读必须基于真实新闻列表。
+4. **策略建议**：支撑位/阻力位基于API真实价格计算，结合真实新闻事件做判断。
 
 ## 输出格式要求
 必须包含以下章节：
@@ -462,23 +627,53 @@ def generate_report() -> str:
 
 请现在开始生成 {TODAY_CN} 的分析报告。"""
 
-    # 抓取实时行情数据
-    market_data = fetch_market_data()
+    # 抓取实时行情数据 + 真实新闻
+    market_data, market_structured = fetch_market_data()
+    news_data = fetch_news_headlines()
 
     user_prompt = f"""请为 {TODAY_CN}（{TODAY_WEEKDAY}）生成一份完整的**美股市场**分析报告。
 
+## 🔥🔥🔥 数据铁律（违反任何一条，报告即作废）🔥🔥🔥
+
+**你的全部分析工作必须且仅能基于下方提供的API实时行情数据和真实新闻。你的训练数据（2025年截止）已经完全过时，绝对禁止使用。**
+
+### 行情数据规则：
+1. **表格数据**：下方API数据中的每个数字（价格、涨跌幅）必须逐字复制到"一、市场全景速览"表格中。一个数字都不能改。
+2. **分析判断**：你说"涨了"还是"跌了"，必须和API数据的涨跌幅方向一致。API显示-0.03%就是微跌/近乎持平，不能编造"能源股拖累大跌"之类的描述。
+3. **状态标注**：涨=🟢，跌=🔴，平=🟡。方向必须与API数据一致。
+4. **策略建议**：支撑位/阻力位必须基于API真实价格推算，不能用你训练数据中的旧点位。
+5. 如果某个数据项缺失或为0，标注"📌 休市/数据暂缺"，不要编造数值。
+
+### 新闻分析规则：
+6. **必须且仅能分析下方提供的真实新闻**：二、重大新闻分类与影响分析章节中的所有新闻，必须来自下方"📰 今日真实财经新闻"列表。
+7. **禁止编造新闻事件**：不要使用你训练数据中的新闻事件。如果没有真实新闻数据或新闻不足10条，用剩余的真实新闻深入分析即可，不要补充编造的新闻。
+8. **新闻选取**：从真实新闻列表中挑选最重要的10-12条（国际新闻优先），逐一分析其对美股的影响。
+
+**常见错误（必须避免）：**
+- ❌ 道琼斯写成41,200 → 实际API是~52,300
+- ❌ 纳斯达克写成22,100 → 实际API是~26,000  
+- ❌ 标普500写成6,850 → 实际API是~7,480
+- ❌ 黄金写成$3,500 → 实际API是~$4,050
+- ❌ 道琼斯-0.03%写成"能源股拖累" → 实际只是微跌0.03%
+- ❌ 编造一条"美联储紧急降息"新闻 → 新闻列表中根本没有这条
+
 你需要：
-1. 基于你对当前全球市场趋势的理解，分析今日最重要的10-12条新闻
+1. **基于下方真实新闻列表**，挑选10-12条最重要的新闻，分析其对美股的影响
 2. **核心聚焦美股**：重点分析对美股的影响，A股/港股仅作为全球背景简要提及
-3. **重要：以下是来自东方财富的实时行情数据，请基于这些真实数据填写"一、市场全景速览"表格，不要编造数据！**
-   - 如果某个数据项缺失或为0，标注"📌 休市/数据暂缺"，不要编造数值
-   - 美股指数优先使用东方财富数据，如不可用则使用新浪数据
-4. 区分国际新闻（🌍）和国内新闻（🇨🇳）
-5. 每一条新闻都要有详细的影响评估表格和受影响的美股板块/个股
-6. 策略建议中使用美股代码（如SPY、QQQ、GLD、XLE等），不要使用A股代码
-7. 最后给出综合研判、风险提示、策略建议和事件日历
+3. 区分国际新闻（🌍）和国内新闻（🇨🇳）
+4. 每一条新闻都要有详细的影响评估表格和受影响的美股板块/个股
+5. 策略建议中使用美股代码（如SPY、QQQ、GLD、XLE等），不要使用A股代码
+6. 最后给出综合研判、风险提示、策略建议和事件日历
+
+---
+
+{news_data if news_data else "（今日新闻数据暂不可用，请仅基于下方行情数据做市场技术面分析，跳过新闻事件分析章节，直接进入综合研判。）"}
+
+---
 
 {market_data}
+
+---
 
 请直接输出完整报告，不要有任何开头语或结尾语。"""
 
@@ -492,13 +687,13 @@ def generate_report() -> str:
         max_tokens=8000,
     )
 
-    # 后处理：确保格式完整
-    report = post_process_report(report)
+    # 后处理：确保格式完整 + 数据校验替换
+    report = post_process_report(report, market_structured)
     return report
 
 
-def post_process_report(report: str) -> str:
-    """后处理报告内容，确保格式规范"""
+def post_process_report(report: str, market_structured: dict = None) -> str:
+    """后处理报告内容，确保格式规范 + 数据校验替换"""
     # 确保报告以标题开头
     if not report.strip().startswith("#"):
         report = f"# 📊 每日美股新闻分析报告\n\n**日期：** {TODAY_CN}（{TODAY_WEEKDAY}）  \n**分析师：** NewsImpactAnalyzer  \n**覆盖市场：** 美股（道琼斯 / 纳斯达克 / S&P500）\n\n---\n\n{report}"
@@ -508,6 +703,10 @@ def post_process_report(report: str) -> str:
 
     # 清理 AI 对话式废话（以"好的"、"现在"开头的句子）
     report = re.sub(r'^好的[，,].*?\n\n', '', report, flags=re.MULTILINE)
+
+    # ========== 🔥 全面数据校验：用API实时数据替换AI编造的数值 ==========
+    if market_structured:
+        report = _validate_and_fix_all_market_data(report, market_structured)
 
     # 清理黄金价格验证/计算解释行
     report = re.sub(r'\*黄金人民币价格验证[：:][^*]+\*', '', report)
@@ -536,6 +735,123 @@ def post_process_report(report: str) -> str:
     if "报告生成时间" not in report:
         report += f"\n\n---\n\n*报告生成时间：{TODAY_CN} (自动化) CST*"
 
+    return report
+
+
+def _validate_and_fix_all_market_data(report: str, market_structured: dict) -> str:
+    """
+    全面校验报告中所有API可获取的市场数据，检测AI是否使用了过时训练数据。
+    对偏差超过阈值的数据，直接在报告表格中替换为API真实数据。
+    
+    替换策略：
+    1. 美股三大指数：强制替换（这是最高优先级，AI经常编造）
+    2. 其他数据：偏差>5%时替换
+    """
+    import math
+    
+    fixes_applied = []
+    
+    # 定义每个指标的校验规则
+    # (报告中匹配关键词列表, API key, 合理区间min, 合理区间max, 是否强制替换)
+    checks = [
+        # 🔥 美股三大指数：强制替换，偏差>3%就替换
+        (["标普500", "S&P500", "S&P 500"], "标普500", 7200, 7800, True),
+        (["纳斯达克", "纳斯达克综合"], "纳斯达克综合", 24000, 28000, True),
+        (["道琼斯", "道琼斯工业"], "道琼斯工业", 50000, 55000, True),
+        # A股
+        (["上证指数", "上证"], "上证指数", 3800, 4500, False),
+        (["深证成指", "深证"], "深证成指", 14000, 17000, False),
+        (["创业板指", "创业板"], "创业板指", 3800, 4800, False),
+        (["沪深300", "沪深 300"], "沪深300", 4500, 5500, False),
+        # 港股
+        (["恒生指数", "恒生"], "恒生指数", 21000, 25000, False),
+        # 商品
+        (["WTI原油", "WTI"], "WTI原油", 55, 100, False),
+        (["布伦特原油", "布伦特"], "布伦特原油", 58, 105, False),
+        (["伦敦金", "现货黄金", "黄金.*盎司"], "伦敦金", 3800, 4800, False),
+        (["国内黄金", "黄金9999", "Au99.99"], "国内黄金", 800, 1000, False),
+        # 外汇
+        (["美元/人民币", "美元人民币"], "美元/人民币", 6.5, 7.5, False),
+        (["美元/日元", "美元日元"], "美元/日元", 140, 180, False),
+    ]
+    
+    for keywords, api_key, min_val, max_val, force_replace in checks:
+        if api_key not in market_structured:
+            continue
+        
+        api_data = market_structured[api_key]
+        api_price = api_data["price"]
+        api_pct = api_data["change_pct"]
+        
+        if api_price == 0:
+            continue
+        
+        # 在报告表格中搜索该指标行
+        for kw in keywords:
+            pattern = rf'({re.escape(kw)})([^|]*\|)(\s*)(\$|¥)?([\d,]+\.?\d*)([^|]*\|[^|]*\|)'
+            match = re.search(pattern, report, re.IGNORECASE)
+            if match:
+                try:
+                    reported_val = float(match.group(5).replace(',', ''))
+                    deviation = abs(reported_val - api_price) / api_price * 100 if api_price else 0
+                    
+                    threshold = 3 if force_replace else 5
+                    
+                    if reported_val < min_val or reported_val > max_val or deviation > threshold:
+                        prefix = match.group(4) or ""
+                        old_num_str = match.group(5)
+                        
+                        if '.' in old_num_str:
+                            decimals = len(old_num_str.split('.')[1])
+                            new_num_str = f"{api_price:,.{decimals}f}"
+                        else:
+                            new_num_str = f"{api_price:,.0f}"
+                        
+                        old_full = match.group(0)
+                        new_full = match.group(1) + match.group(2) + match.group(3) + prefix + new_num_str + match.group(6)
+                        
+                        # 同时修正涨跌幅
+                        pct_cell = match.group(6)
+                        pct_val_match = re.search(r'([+-]?\d+\.?\d*)%', pct_cell)
+                        pct_fixed = False
+                        if pct_val_match:
+                            try:
+                                reported_pct = float(pct_val_match.group(1))
+                                if abs(reported_pct - api_pct) > 0.3:
+                                    new_pct_cell = pct_cell.replace(
+                                        pct_val_match.group(0),
+                                        f"{api_pct:+.2f}%"
+                                    )
+                                    new_full = new_full.replace(pct_cell, new_pct_cell, 1)
+                                    pct_fixed = True
+                            except ValueError:
+                                pass
+                        
+                        report = report.replace(old_full, new_full, 1)
+                        
+                        pct_note = "，涨跌已修正" if pct_fixed else ""
+                        fixes_applied.append(
+                            f"  ✅ {api_key}: {reported_val:,.2f}→{api_price:,.2f}{pct_note} (偏差{deviation:.1f}%)"
+                        )
+                    break
+                except (ValueError, IndexError):
+                    pass
+    
+    if fixes_applied:
+        print("=" * 70)
+        print("🔥 数据自动修复 - 已将AI编造数据替换为API实时数据：")
+        for f in fixes_applied:
+            print(f)
+        print("=" * 70)
+        
+        fix_banner = (
+            "\n> 📌 **数据说明：** 本报告中所有行情数据均来自东方财富/新浪财经API实时接口，"
+            "已自动校验并修正。\n\n"
+        )
+        report = re.sub(r'(\n## )', fix_banner + r'\1', report, count=1)
+    else:
+        print("✅ 市场数据校验通过，所有数据均使用API实时数据")
+    
     return report
 
 

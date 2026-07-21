@@ -46,7 +46,7 @@ jobs:
       - name: 清除旧报告（仅保留最近3天）
         run: |
           python -c "
-          import os, glob, re
+          import os, glob, re, subprocess
           from datetime import datetime, timedelta, timezone
           TZ = timezone(timedelta(hours=8))
           now = datetime.now(TZ)
@@ -58,7 +58,8 @@ jobs:
               if match:
                   d = datetime.strptime(match.group(1), '%Y%m%d').replace(tzinfo=TZ)
                   if d < cutoff:
-                      os.remove(f)
+                      # 必须 git rm，否则后续 git add glob 不会捕获删除
+                      subprocess.run(['git', 'rm', f], check=False, capture_output=True)
                       deleted += 1
                       print(f'  🗑 已删除: {f}')
           print(f'✅ 清理完成，删除了 {deleted} 个旧报告')

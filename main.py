@@ -772,6 +772,43 @@ def generate_report() -> str:
     return report
 
 
+def _normalize_table_separators(report: str) -> str:
+    """
+    归一化所有 Markdown 表格的分隔行，防止 AI 生成的变体（如 |:--|、tab 分隔的 :--、
+    缺少首尾 pipe 等）在某些渲染器里被当成数据行显示。
+    规则：每个表格的第 2 行（分隔行）统一改为与表头列数一致的 '|---|---|...' 形式。
+    """
+    lines = report.split('\n')
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        # 当前行是表格首行（表头）
+        if stripped.startswith('|') and stripped.endswith('|'):
+            # 计算表头列数
+            header_cells = [c.strip() for c in stripped[1:-1].split('|')]
+            ncols = len(header_cells)
+            # 下一行应该是分隔行
+            if i + 1 < len(lines):
+                nxt = lines[i + 1].strip()
+                # 判断是否像分隔行：只含 - : | 空格 tab，且至少有一个 -
+                is_sep_like = bool(re.match(r'^[|:\-\s\t]+$', nxt)) and '-' in nxt
+                if is_sep_like:
+                    # 统一替换为标准分隔行
+                    out.append(line)
+                    out.append('|' + '---|' * ncols)
+                    i += 2
+                    # 继续输出后续表格数据行，直到表格结束
+                    while i < len(lines) and lines[i].strip().startswith('|'):
+                        out.append(lines[i])
+                        i += 1
+                    continue
+        out.append(line)
+        i += 1
+    return '\n'.join(out)
+
+
 def post_process_report(report: str, market_structured: dict = None) -> str:
     """后处理报告内容，确保格式规范 + 数据校验替换"""
     # 确保报告以标题开头
@@ -803,6 +840,9 @@ def post_process_report(report: str, market_structured: dict = None) -> str:
                 continue  # 跳过重复的一级标题
         cleaned_lines.append(line)
     report = '\n'.join(cleaned_lines)
+
+    # ========== 表格分隔符归一化：把 |:--| 或 tab 分隔的 :-- 统一成标准 |---| ==========
+    report = _normalize_table_separators(report)
 
     # ========== 关键修复：将表格内的"受影响板块/个股"行提取到表格下方 ==========
     report = _extract_affected_stocks_from_tables(report)
@@ -1077,8 +1117,8 @@ def markdown_to_html(md_content: str) -> str:
         # 表格
         if stripped.startswith("|") and stripped.endswith("|"):
             cells = [c.strip() for c in stripped[1:-1].split("|")]
-            # 跳过分隔行 (|---|---|)
-            if all(re.match(r"^:?-{3,}:?$", c) for c in cells):
+            # 跳过分隔行 (|---|---| 或 |:--|:--| 等，2个及以上 dash 均视为分隔行)
+            if all(re.match(r"^:?-{2,}:?$", c) for c in cells):
                 i += 1
                 continue
             if not in_table:

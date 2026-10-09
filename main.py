@@ -102,6 +102,33 @@ def _em_indices(secids: str) -> dict:
         return {}
 
 
+def _em_last_session(secid: str) -> dict:
+    """
+    获取指数最近一个"已完成交易日"的收盘价与涨跌幅（东方财富日K线接口）。
+    用于盘前（当日尚未开盘）时展示上一交易日的真实表现——因为盘前 push2 接口
+    的涨跌幅会返回 0，直接使用会让报告把 A股 误写成"平开/持平"。
+    返回 {"date": "2026-10-08", "close": 3811.90, "change_pct": -0.79}；失败返回 {}。
+    """
+    url = (
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        f"?secid={secid}&fields1=f1&fields2=f51,f53,f59&klt=101&fqt=1&lmt=2"
+    )
+    try:
+        data = json.loads(_http_get(url))
+        klines = data.get("data", {}).get("klines", [])
+        if not klines:
+            return {}
+        parts = klines[-1].split(",")  # [日期, 收盘, 涨跌幅]
+        return {
+            "date": parts[0],
+            "close": float(parts[1]),
+            "change_pct": float(parts[2]),
+        }
+    except Exception as e:
+        print(f"⚠️ 获取上一交易日数据失败({secid}): {e}")
+        return {}
+
+
 def _sina_indices(codes: str) -> dict:
     """
     新浪财经实时行情接口
@@ -176,13 +203,33 @@ def fetch_market_data():
     em_a = _em_indices("1.000001,0.399001,0.399006,1.000300")
     if em_a:
         data_parts.append("### 🇨🇳 A股主要指数")
+        _a_secids = {"000001": "1.000001", "399001": "0.399001",
+                     "399006": "0.399006", "000300": "1.000300"}
+        _a_preopen = False
         for code in ["000001", "399001", "399006", "000300"]:
             d = em_a.get(code)
-            if d:
-                data_parts.append(
-                    f"- **{d['name']}**: {d['price']:.2f}，涨跌 {d['change_pct']:+.2f}%"
-                )
-                structured[d['name']] = {"price": d['price'], "change_pct": d['change_pct']}
+            if not d:
+                continue
+            # 判断是否盘前：日K线最后一条若不是今日，说明今日尚未开盘，
+            # 此时接口涨跌幅恒为 0，改用上一交易日收盘价与涨跌幅，避免误导分析。
+            prev = _em_last_session(_a_secids[code])
+            prev_date = prev.get("date", "").replace("-", "")
+            if prev and prev_date and prev_date != TODAY:
+                price, change_pct = prev["close"], prev["change_pct"]
+                tag = f"（{prev['date']} 收盘）"
+                _a_preopen = True
+            else:
+                price, change_pct = d["price"], d["change_pct"]
+                tag = ""
+            data_parts.append(
+                f"- **{d['name']}**: {price:.2f}，涨跌 {change_pct:+.2f}%{tag}"
+            )
+            structured[d['name']] = {"price": price, "change_pct": change_pct}
+        if _a_preopen:
+            data_parts.append(
+                "> 📌 注：A股当前处于**盘前**（尚未开盘），以上为最近交易日收盘数据，"
+                "涨跌幅为**上一交易日**的真实涨跌。"
+            )
         data_parts.append("")
 
     # ============ 东方财富：港股指数 ============
@@ -718,11 +765,12 @@ def generate_report() -> str:
 3. **状态标注**：涨=🟢，跌=🔴，平=🟡。方向必须与API数据一致。
 4. **策略建议**：支撑位/阻力位必须基于API真实价格推算，不能用你训练数据中的旧点位。
 5. 如果某个数据项缺失或为0，标注"📌 休市/数据暂缺"，不要编造数值。
+6. **A股盘前数据（重要）**：若A股行情带有"（X月X日 收盘）"标注，表示当日尚未开盘，该价格是**最近交易日收盘价**、涨跌幅是**上一交易日**的真实涨跌。必须如实描述上一交易日的涨跌方向（例如"上一交易日A股收跌"），**严禁**写成"+0.00%／平开／持平／多空拉锯"，也不得据此编造看多结论。
 
 ### 新闻分析规则：
-6. **必须且仅能分析下方提供的真实新闻**：二、重大新闻分类与影响分析章节中的所有新闻，必须来自下方"📰 今日真实财经新闻"列表。
-7. **禁止编造新闻事件**：不要使用你训练数据中的新闻事件。如果没有真实新闻数据或新闻不足10条，用剩余的真实新闻深入分析即可，不要补充编造的新闻。
-8. **新闻选取比例（核心，必须严格遵守）**：从真实新闻列表中挑选最重要的10-12条：
+7. **必须且仅能分析下方提供的真实新闻**：二、重大新闻分类与影响分析章节中的所有新闻，必须来自下方"📰 今日真实财经新闻"列表。
+8. **禁止编造新闻事件**：不要使用你训练数据中的新闻事件。如果没有真实新闻数据或新闻不足10条，用剩余的真实新闻深入分析即可，不要补充编造的新闻。
+9. **新闻选取比例（核心，必须严格遵守）**：从真实新闻列表中挑选最重要的10-12条：
    - 美股/全球新闻（🌍）：约5-6条
    - 国内A股新闻（🇨🇳）：约5-6条
    - 其他市场新闻（🌏 港股/日韩/欧洲等）：合并选取1-2条即可
